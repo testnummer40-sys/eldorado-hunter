@@ -2,6 +2,9 @@
   "alerted_urls": [
     "__error__::TimeoutError"
   ],
-  "last_run": "2026-11-05T12:26:45+00:00",
-  "last_error": "TimeoutError: Page.wait_for_selector: Timeout 20000ms exceeded.\nCall log:\n  - waiting for locator(\"table, [role='row'], .pet-row, .value-row\") to be visible\n"
+  "last_run": "2026-11-05T12:37:21+00:00",
+  "last_error": null,
+  "deals_count": 0,
+  "alerts_count": 0,
+  "new_alerts_sent": 0
 }
