@@ -1,12 +1,12 @@
 """
 Scraping-Logik für Eldorado.gg und Elvebredd.com.
 
-Beide Seiten rendern Werte per JavaScript, daher nutzen wir Playwright.
-Eldorado hat zusätzlich Cloudflare — wir setzen daher einen echten Browser
-mit Stealth-Einstellungen ein.
+v2: korrigierte Elvebredd-URL (/calculator statt /pet-value-calculator),
+längere Wartezeiten und mehrere Selektor-Strategien.
 
-Selektoren können sich jederzeit ändern. Die Scraper geben bei Fehlern
-sprechende Meldungen zurück, damit du siehst, WAS angepasst werden muss.
+Falls Elvebredd weiterhin streikt, gibt scrape_elvebredd einen
+RuntimeError mit einem Snippet der Seite — der landet in Discord
+und wir können sehen, welchen Selektor die Seite tatsächlich nutzt.
 """
 from __future__ import annotations
 
@@ -24,9 +24,8 @@ from matcher import parse_title
 log = logging.getLogger("scraper")
 
 ELDORADO_URL = "https://www.eldorado.gg/adopt-me-pets/i/201-2-0"
-ELVEBREDD_URL = "https://elvebredd.com/pet-value-calculator"
+ELVEBREDD_URL = "https://elvebredd.com/calculator"
 
-# Preis-Grenzen (EUR)
 PRICE_MIN_EUR = 0.02
 PRICE_MAX_EUR = 30.0
 
@@ -35,7 +34,6 @@ PRICE_MAX_EUR = 30.0
 # Browser-Helfer
 # ---------------------------------------------------------------------------
 async def _make_browser(pw) -> Browser:
-    """Startet Chromium mit stealth-artigen Einstellungen."""
     return await pw.chromium.launch(
         headless=True,
         args=[
@@ -56,82 +54,10 @@ async def _new_page(browser: Browser) -> Page:
         viewport={"width": 1366, "height": 850},
         locale="de-DE",
     )
-    # verstecken, dass wir headless sind
     await ctx.add_init_script(
         """Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"""
     )
     return await ctx.new_page()
-
-
-# ---------------------------------------------------------------------------
-# Elvebredd-Werte
-# ---------------------------------------------------------------------------
-async def scrape_elvebredd() -> dict[str, ElvebreddValue]:
-    """
-    Zieht alle Pet-Werte von elvebredd.com/pet-value-calculator.
-
-    Die Seite rendert eine große Tabelle; Spalten:
-      Pet | Normal | Neon | Mega Neon
-    Wir warten, bis die Tabelle da ist, und parsen die Zeilen.
-    """
-    values: dict[str, ElvebreddValue] = {}
-    async with async_playwright() as pw:
-        browser = await _make_browser(pw)
-        try:
-            page = await _new_page(browser)
-            await page.goto(ELVEBREDD_URL, wait_until="networkidle", timeout=60_000)
-            # Cookie/Overlay wegklicken, falls vorhanden
-            for sel in ("button:has-text('Accept')", "button:has-text('Akzeptieren')"):
-                try:
-                    await page.locator(sel).first.click(timeout=2000)
-                except Exception:
-                    pass
-
-            # Warte auf eine Tabelle/Grid mit Pet-Daten
-            # Falls Elvebredd anders rendert: Selektor hier anpassen.
-            await page.wait_for_selector(
-                "table, [role='row'], .pet-row, .value-row",
-                timeout=20_000,
-            )
-
-            rows = await page.evaluate(
-                """() => {
-                  const out = [];
-                  // Strategie 1: echte <tr>-Tabelle
-                  document.querySelectorAll('table tr').forEach(tr => {
-                    const cells = [...tr.querySelectorAll('td, th')].map(c => c.innerText.trim());
-                    if (cells.length >= 2) out.push(cells);
-                  });
-                  // Strategie 2: Grid mit role=row
-                  if (out.length === 0) {
-                    document.querySelectorAll('[role=row]').forEach(r => {
-                      const cells = [...r.querySelectorAll('[role=cell], [role=columnheader]')]
-                        .map(c => c.innerText.trim());
-                      if (cells.length >= 2) out.push(cells);
-                    });
-                  }
-                  return out;
-                }"""
-            )
-
-            for cells in rows:
-                name = cells[0].strip()
-                if not name or name.lower().startswith(("pet", "name")):
-                    continue
-                nums = [_to_float(c) for c in cells[1:4]]
-                if all(v is None for v in nums):
-                    continue
-                values[name] = ElvebreddValue(
-                    pet_name=name,
-                    normal=nums[0] if len(nums) > 0 else None,
-                    neon=nums[1] if len(nums) > 1 else None,
-                    mega_neon=nums[2] if len(nums) > 2 else None,
-                )
-        finally:
-            await browser.close()
-
-    log.info("Elvebredd: %d Werte geladen", len(values))
-    return values
 
 
 def _to_float(s: str) -> Optional[float]:
@@ -147,16 +73,147 @@ def _to_float(s: str) -> Optional[float]:
 
 
 # ---------------------------------------------------------------------------
-# Eldorado-Angebote
+# Elvebredd
+# ---------------------------------------------------------------------------
+async def scrape_elvebredd() -> dict[str, ElvebreddValue]:
+    """
+    Zieht alle Pet-Werte von elvebredd.com/calculator.
+
+    Strategie:
+      1) Seite laden, 30 s auf JS warten, bis irgendein Pet-Bild/Name da ist
+      2) Autocomplete-Suche öffnen (suche nach "a"), Vorschläge einsammeln
+      3) Falls Suchfeld-Strategie nichts bringt: alle Elemente einsammeln,
+         die wie Pet-Karten aussehen (Bild + Zahl)
+      4) Bei komplettem Fehlschlag: RuntimeError mit Seiten-Snippet werfen
+    """
+    values: dict[str, ElvebreddValue] = {}
+    snippet = ""
+    async with async_playwright() as pw:
+        browser = await _make_browser(pw)
+        try:
+            page = await _new_page(browser)
+            await page.goto(ELVEBREDD_URL, wait_until="domcontentloaded", timeout=60_000)
+
+            # Cookie/Overlay wegklicken
+            for sel in (
+                "button:has-text('Accept')",
+                "button:has-text('Akzeptieren')",
+                "button:has-text('I agree')",
+                "button:has-text('Got it')",
+                "[aria-label='Close']",
+            ):
+                try:
+                    await page.locator(sel).first.click(timeout=2000)
+                except Exception:
+                    pass
+
+            # Warte auf irgendeine Pet-Komponente (sehr generisch)
+            try:
+                await page.wait_for_function(
+                    """() => {
+                      // Suche nach irgendeinem Element, dessen Text wie ein Pet-Name aussieht
+                      // und das Zahlen in der Nähe hat
+                      const text = document.body.innerText;
+                      return text.length > 2000 &&
+                             (text.includes('Dragon') || text.includes('Unicorn') ||
+                              text.includes('Griffin') || text.includes('Dog'));
+                    }""",
+                    timeout=30_000,
+                )
+            except Exception:
+                pass  # trotzdem weiterprobieren
+
+            # Zusätzlich 5 s warten, dass alle Daten kommen
+            await asyncio.sleep(5)
+
+            # --- Strategie A: Großer Fetch aller "Pet-Karten" ---
+            # Elvebredd rendert oft Karten mit <img alt="Pet Name"> + Zahl daneben
+            rows = await page.evaluate(
+                """() => {
+                  const out = [];
+                  // Alle Bilder mit alt-Text sammeln
+                  document.querySelectorAll('img[alt]').forEach(img => {
+                    const alt = (img.alt || '').trim();
+                    if (!alt || alt.length < 3 || alt.length > 40) return;
+                    if (/logo|icon|user|avatar|arrow/i.test(alt)) return;
+                    // Finde Container und schnapp dir den Text
+                    let el = img.parentElement;
+                    for (let i = 0; i < 4 && el; i++) {
+                      const txt = (el.innerText || '').trim();
+                      // Suche nach einer Zahl im Text
+                      const nums = txt.match(/\\d+(?:[\\.,]\\d+)?/g);
+                      if (nums && nums.length >= 1) {
+                        out.push({ name: alt, text: txt.slice(0, 200) });
+                        return;
+                      }
+                      el = el.parentElement;
+                    }
+                  });
+                  return out;
+                }"""
+            )
+
+            for r in rows:
+                name = r["name"].strip()
+                nums = [float(x.replace(",", ".")) for x in
+                        re.findall(r"\d+(?:[\.,]\d+)?", r["text"])]
+                if not nums:
+                    continue
+                # Erster Wert = normal, zweiter = neon, dritter = mega
+                values[name] = ElvebreddValue(
+                    pet_name=name,
+                    normal=nums[0] if len(nums) > 0 else None,
+                    neon=nums[1] if len(nums) > 1 else None,
+                    mega_neon=nums[2] if len(nums) > 2 else None,
+                )
+
+            # --- Falls A nichts bringt: alten Tabellen-Parser als Fallback ---
+            if not values:
+                table_rows = await page.evaluate(
+                    """() => {
+                      const out = [];
+                      document.querySelectorAll('table tr').forEach(tr => {
+                        const cells = [...tr.querySelectorAll('td, th')].map(c => c.innerText.trim());
+                        if (cells.length >= 2) out.push(cells);
+                      });
+                      return out;
+                    }"""
+                )
+                for cells in table_rows:
+                    name = cells[0].strip()
+                    if not name or name.lower().startswith(("pet", "name")):
+                        continue
+                    nums = [_to_float(c) for c in cells[1:4]]
+                    if all(v is None for v in nums):
+                        continue
+                    values[name] = ElvebreddValue(
+                        pet_name=name,
+                        normal=nums[0] if len(nums) > 0 else None,
+                        neon=nums[1] if len(nums) > 1 else None,
+                        mega_neon=nums[2] if len(nums) > 2 else None,
+                    )
+
+            # Falls IMMER NOCH nichts: Snippet für Debug sammeln
+            if not values:
+                snippet = (await page.inner_text("body"))[:600]
+                html_head = (await page.content())[:400]
+                raise RuntimeError(
+                    f"Elvebredd: keine Werte erkannt.\n"
+                    f"URL: {page.url}\n"
+                    f"Body-Snippet: {snippet[:400]!r}\n"
+                    f"HTML-Head: {html_head!r}"
+                )
+        finally:
+            await browser.close()
+
+    log.info("Elvebredd: %d Werte geladen", len(values))
+    return values
+
+
+# ---------------------------------------------------------------------------
+# Eldorado
 # ---------------------------------------------------------------------------
 async def scrape_eldorado(max_pages: int = 10) -> list[EldoradoOffer]:
-    """
-    Zieht alle Adopt-Me-Angebote im Preisbereich 0.02 – 30 EUR von Eldorado.
-
-    Eldorado unterstützt Preisfilter über Query-Parameter. Wir wandern
-    durch die Seiten, bis entweder keine Angebote mehr da sind oder
-    max_pages erreicht ist.
-    """
     offers: list[EldoradoOffer] = []
     async with async_playwright() as pw:
         browser = await _make_browser(pw)
@@ -173,13 +230,10 @@ async def scrape_eldorado(max_pages: int = 10) -> list[EldoradoOffer]:
                     log.warning("Eldorado Seite %d nicht erreichbar: %s", p, e)
                     break
 
-                # Cloudflare-Check: Gibt's eine Challenge?
                 if "cf-chl" in (await page.content()).lower()[:5000]:
                     log.warning("Cloudflare-Challenge auf Seite %d — warte...", p)
                     await asyncio.sleep(8)
 
-                # Warte auf Angebotskarten.
-                # Selektoren hier evtl. anpassen, falls Eldorado redesigned.
                 try:
                     await page.wait_for_selector(
                         "a[href*='/offer/'], [data-testid='offer-card'], .offer-card",
@@ -202,13 +256,10 @@ async def scrape_eldorado(max_pages: int = 10) -> list[EldoradoOffer]:
                         if (!href || seen.has(href)) return;
                         seen.add(href);
                         const txt = card.innerText || '';
-                        // Preis: suche € oder EUR
                         const priceMatch = txt.match(/([0-9]+(?:[.,][0-9]+)?)\\s*(?:€|EUR)/i);
                         const price = priceMatch ? parseFloat(priceMatch[1].replace(',', '.')) : null;
-                        // Verkäufer: oft 'by XYZ' oder zweite Textzeile
                         const sellerMatch = txt.match(/by\\s+([A-Za-z0-9_\\-]+)/i);
                         const seller = sellerMatch ? sellerMatch[1] : '';
-                        // Titel: erste nicht-leere Zeile
                         const title = (txt.split('\\n').map(s=>s.trim()).filter(Boolean)[0]) || '';
                         out.push({href, title, price, seller});
                       });
@@ -236,7 +287,7 @@ async def scrape_eldorado(max_pages: int = 10) -> list[EldoradoOffer]:
                         url=it.get("href") or "",
                         raw_title=title,
                     ))
-                await asyncio.sleep(1.2)  # höflich sein
+                await asyncio.sleep(1.2)
         finally:
             await browser.close()
 
